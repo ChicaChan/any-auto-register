@@ -168,11 +168,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             account.extra.setdefault("luckmail_domain", merged_extra.get("luckmail_domain"))
                         if merged_extra.get("luckmail_base_url"):
                             account.extra.setdefault("luckmail_base_url", merged_extra.get("luckmail_base_url"))
-                save_account(account)
+                saved_account = save_account(account)
                 if _proxy: proxy_pool.report_success(_proxy)
                 _log(task_id, f"✓ 注册成功: {account.email}")
                 _save_task_log(req.platform, account.email, "success")
-                _auto_upload_integrations(task_id, account)
+                _auto_upload_integrations(task_id, saved_account or account)
                 cashier_url = (account.extra or {}).get("cashier_url", "")
                 if cashier_url:
                     _log(task_id, f"  [升级链接] {cashier_url}")

@@ -19,9 +19,15 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: 'TempMail.lol（自动生成）', value: 'tempmail_lol' },
     { label: 'DuckMail（自动生成）', value: 'duckmail' },
     { label: 'MoeMail (sall.cc)', value: 'moemail' },
+    { label: 'YYDS Mail / MaliAPI', value: 'maliapi' },
     { label: 'Freemail（自建 CF Worker）', value: 'freemail' },
     { label: 'CF Worker（自建域名）', value: 'cfworker' },
     { label: 'LuckMail（订单接码 / 已购邮箱）', value: 'luckmail' },
+  ],
+  maliapi_auto_domain_strategy: [
+    { label: 'balanced', value: 'balanced' },
+    { label: 'prefer_owned', value: 'prefer_owned' },
+    { label: 'prefer_public', value: 'prefer_public' },
   ],
   default_executor: [
     { label: 'API 协议（无浏览器）', value: 'protocol' },
@@ -87,6 +93,16 @@ const TAB_ITEMS = [
         fields: [{ key: 'moemail_api_url', label: 'API URL', placeholder: 'https://sall.cc' }],
       },
       {
+        title: 'YYDS Mail / MaliAPI',
+        desc: '基于 API Key 创建临时邮箱并轮询收件箱消息',
+        fields: [
+          { key: 'maliapi_base_url', label: 'API URL', placeholder: 'https://maliapi.215.im/v1' },
+          { key: 'maliapi_api_key', label: 'API Key', secret: true },
+          { key: 'maliapi_domain', label: '邮箱域名（可选）', placeholder: 'example.com' },
+          { key: 'maliapi_auto_domain_strategy', label: '自动域名策略', type: 'select' },
+        ],
+      },
+      {
         title: 'TempMail.lol',
         desc: '自动生成邮箱，无需配置，需要代理访问（CN IP 被封）',
         fields: [],
@@ -106,6 +122,7 @@ const TAB_ITEMS = [
         fields: [
           { key: 'cfworker_api_url', label: 'API URL', placeholder: 'https://apimail.example.com' },
           { key: 'cfworker_admin_token', label: '管理员 Token', secret: true },
+          { key: 'cfworker_custom_auth', label: '站点密码', secret: true },
           { key: 'cfworker_domain', label: '邮箱域名', placeholder: 'example.com' },
           { key: 'cfworker_fingerprint', label: 'Fingerprint', placeholder: '6703363b...' },
         ],
@@ -165,6 +182,18 @@ const TAB_ITEMS = [
           { key: 'codex_proxy_url', label: 'API URL', placeholder: 'https://your-codex-proxy.example.com' },
           { key: 'codex_proxy_key', label: 'Admin Key', secret: true },
           { key: 'codex_proxy_upload_type', label: '上传类型' },
+        ],
+      },
+      {
+        title: 'SMSToMe 手机验证',
+        desc: 'ChatGPT add_phone 阶段自动取号并轮询短信验证码',
+        fields: [
+          { key: 'smstome_cookie', label: 'SMSToMe Cookie', secret: true },
+          { key: 'smstome_country_slugs', label: '国家列表', placeholder: 'united-kingdom,poland' },
+          { key: 'smstome_phone_attempts', label: '手机号尝试次数', placeholder: '3' },
+          { key: 'smstome_otp_timeout_seconds', label: '短信等待秒数', placeholder: '45' },
+          { key: 'smstome_poll_interval_seconds', label: '轮询间隔秒数', placeholder: '5' },
+          { key: 'smstome_sync_max_pages_per_country', label: '每国同步页数', placeholder: '5' },
         ],
       },
     ],
@@ -546,6 +575,9 @@ export default function Settings() {
 
   useEffect(() => {
     apiFetch('/config').then((data) => {
+      if (!data.maliapi_base_url) {
+        data.maliapi_base_url = 'https://maliapi.215.im/v1'
+      }
       if (!data.luckmail_base_url) {
         data.luckmail_base_url = 'https://mails.luckyous.com/'
       }

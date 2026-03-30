@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from services.chatgpt_sync import persist_cpa_sync_result, upload_chatgpt_account_to_cpa
+
 
 def sync_account(account) -> list[dict[str, Any]]:
     """根据平台将账号同步到外部系统。"""
@@ -15,19 +17,8 @@ def sync_account(account) -> list[dict[str, Any]]:
     if platform == "chatgpt":
         cpa_url = config_store.get("cpa_api_url", "")
         if cpa_url:
-            from platforms.chatgpt.cpa_upload import generate_token_json, upload_to_cpa
-
-            class _A:
-                pass
-
-            a = _A()
-            a.email = account.email
-            extra = account.extra or {}
-            a.access_token = extra.get("access_token") or account.token
-            a.refresh_token = extra.get("refresh_token", "")
-            a.id_token = extra.get("id_token", "")
-
-            ok, msg = upload_to_cpa(generate_token_json(a))
+            ok, msg = upload_chatgpt_account_to_cpa(account)
+            persist_cpa_sync_result(account, ok, msg)
             results.append({"name": "CPA", "ok": ok, "msg": msg})
 
         codex_proxy_url = str(config_store.get("codex_proxy_url", "") or "").strip()

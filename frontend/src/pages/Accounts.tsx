@@ -14,6 +14,7 @@ import {
   Popconfirm,
   Dropdown,
   Typography,
+  Alert,
 } from 'antd'
 import type { MenuProps } from 'antd'
 import {
@@ -37,6 +38,29 @@ const STATUS_COLORS: Record<string, string> = {
   subscribed: 'success',
   expired: 'warning',
   invalid: 'error',
+}
+
+function parseExtraJson(raw: string | undefined) {
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function normalizeAccount(account: any) {
+  const extra = parseExtraJson(account.extra_json)
+  const syncStatuses = extra.sync_statuses && typeof extra.sync_statuses === 'object' ? extra.sync_statuses : {}
+  const cpaSync = syncStatuses.cpa && typeof syncStatuses.cpa === 'object' ? syncStatuses.cpa : {}
+  return { ...account, extra, cpaSync }
+}
+
+function formatSyncTime(value?: string) {
+  if (!value) return ''
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
 }
 
 function LogPanel({ taskId, onDone }: { taskId: string; onDone: () => void }) {
@@ -119,6 +143,11 @@ function LogPanel({ taskId, onDone }: { taskId: string; onDone: () => void }) {
 
 function ActionMenu({ acc, onRefresh }: { acc: any; onRefresh: () => void }) {
   const [actions, setActions] = useState<any[]>([])
+  const [resultOpen, setResultOpen] = useState(false)
+  const [resultTitle, setResultTitle] = useState('')
+  const [resultStatus, setResultStatus] = useState<'success' | 'error'>('success')
+  const [resultText, setResultText] = useState('')
+  const [resultUrl, setResultUrl] = useState('')
 
   useEffect(() => {
     apiFetch(`/actions/${acc.platform}`)
@@ -126,40 +155,129 @@ function ActionMenu({ acc, onRefresh }: { acc: any; onRefresh: () => void }) {
       .catch(() => {})
   }, [acc.platform])
 
+  const showResult = (title: string, status: 'success' | 'error', text: string, url = '') => {
+    setResultTitle(title)
+    setResultStatus(status)
+    setResultText(text)
+    setResultUrl(url)
+    setResultOpen(true)
+  }
+
+  const copyResultUrl = async () => {
+    if (!resultUrl) return
+    try {
+      await navigator.clipboard.writeText(resultUrl)
+      message.success('链接已复制')
+    } catch {
+      message.error('复制失败')
+    }
+  }
+
   const handleAction = async (actionId: string) => {
+    const actionLabel = actions.find((item) => item.id === actionId)?.label || actionId
+
     try {
       const r = await apiFetch(`/actions/${acc.platform}/${acc.id}/${actionId}`, {
         method: 'POST',
         body: JSON.stringify({ params: {} }),
       })
       if (!r.ok) {
-        message.error(r.error || '操作失败')
+        showResult(actionLabel, 'error', r.error || '操作失败')
         return
       }
       const data = r.data || {}
       if (data.url || data.checkout_url || data.cashier_url) {
-        window.open(data.url || data.checkout_url || data.cashier_url, '_blank')
+        const targetUrl = data.url || data.checkout_url || data.cashier_url
+        message.success('链接已生成')
+        showResult(actionLabel, 'success', '操作成功，请在弹窗中打开或复制链接。', targetUrl)
       } else {
         message.success(data.message || '操作成功')
+        const text =
+          typeof data === 'string'
+            ? data
+            : Object.keys(data).length > 0
+              ? JSON.stringify(data, null, 2)
+              : '操作成功'
+        showResult(actionLabel, 'success', text)
       }
       onRefresh()
-    } catch {
-      message.error('请求失败')
+    } catch (e: any) {
+      const detail = e?.message ? String(e.message) : '请求失败'
+      message.error(detail)
+      showResult(actionLabel, 'error', detail)
     }
   }
 
   const menuItems: MenuProps['items'] = actions.map((a) => ({
     key: a.id,
     label: a.label,
-    onClick: () => handleAction(a.id),
   }))
 
   if (actions.length === 0) return null
 
   return (
-    <Dropdown menu={{ items: menuItems }}>
-      <Button type="link" size="small" icon={<MoreOutlined />} />
-    </Dropdown>
+    <>
+      <Dropdown
+        menu={{
+          items: menuItems,
+          onClick: ({ key }) => handleAction(String(key)),
+        }}
+      >
+        <Button type="link" size="small" icon={<MoreOutlined />} />
+      </Dropdown>
+      <Modal
+        title={resultTitle}
+        open={resultOpen}
+        onCancel={() => setResultOpen(false)}
+        footer={[
+          resultUrl ? (
+            <Button key="copy" onClick={copyResultUrl}>
+              复制链接
+            </Button>
+          ) : null,
+          resultUrl ? (
+            <Button
+              key="open"
+              type="primary"
+              onClick={() => window.open(resultUrl, '_blank', 'noopener,noreferrer')}
+            >
+              打开链接
+            </Button>
+          ) : null,
+          <Button key="ok" type={resultUrl ? 'default' : 'primary'} onClick={() => setResultOpen(false)}>
+            确定
+          </Button>,
+        ].filter(Boolean)}
+        maskClosable={false}
+      >
+        <Alert
+          type={resultStatus}
+          showIcon
+          message={resultStatus === 'success' ? '操作完成' : '操作失败'}
+          style={{ marginBottom: 12 }}
+        />
+        {resultUrl ? (
+          <Space direction="vertical" style={{ width: '100%' }}>
+            <Text copyable={{ text: resultUrl }} style={{ wordBreak: 'break-all' }}>
+              {resultUrl}
+            </Text>
+          </Space>
+        ) : null}
+        {resultText ? (
+          <pre
+            style={{
+              margin: 0,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              fontFamily: 'monospace',
+              fontSize: 12,
+            }}
+          >
+            {resultText}
+          </pre>
+        ) : null}
+      </Modal>
+    </>
   )
 }
 
@@ -186,6 +304,7 @@ export default function Accounts() {
   const [importLoading, setImportLoading] = useState(false)
   const [taskId, setTaskId] = useState<string | null>(null)
   const [registerLoading, setRegisterLoading] = useState(false)
+  const [cpaSyncLoading, setCpaSyncLoading] = useState<'pending' | 'selected' | ''>('')
 
   useEffect(() => {
     if (platform) setCurrentPlatform(platform)
@@ -198,7 +317,7 @@ export default function Accounts() {
       if (search) params.set('email', search)
       if (filterStatus) params.set('status', filterStatus)
       const data = await apiFetch(`/accounts?${params}`)
-      setAccounts(data.items)
+      setAccounts((data.items || []).map(normalizeAccount))
       setTotal(data.total)
     } finally {
       setLoading(false)
@@ -305,6 +424,10 @@ export default function Accounts() {
             laoudo_auth: cfg.laoudo_auth,
             laoudo_email: cfg.laoudo_email,
             laoudo_account_id: cfg.laoudo_account_id,
+            maliapi_base_url: cfg.maliapi_base_url,
+            maliapi_api_key: cfg.maliapi_api_key,
+            maliapi_domain: cfg.maliapi_domain,
+            maliapi_auto_domain_strategy: cfg.maliapi_auto_domain_strategy,
             yescaptcha_key: cfg.yescaptcha_key,
             moemail_api_url: cfg.moemail_api_url,
             duckmail_address: cfg.duckmail_address,
@@ -318,8 +441,15 @@ export default function Accounts() {
             freemail_password: cfg.freemail_password,
             cfworker_api_url: cfg.cfworker_api_url,
             cfworker_admin_token: cfg.cfworker_admin_token,
+            cfworker_custom_auth: cfg.cfworker_custom_auth,
             cfworker_domain: cfg.cfworker_domain,
             cfworker_fingerprint: cfg.cfworker_fingerprint,
+            smstome_cookie: cfg.smstome_cookie,
+            smstome_country_slugs: cfg.smstome_country_slugs,
+            smstome_phone_attempts: cfg.smstome_phone_attempts,
+            smstome_otp_timeout_seconds: cfg.smstome_otp_timeout_seconds,
+            smstome_poll_interval_seconds: cfg.smstome_poll_interval_seconds,
+            smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country,
           },
         }),
       })
@@ -338,6 +468,96 @@ export default function Accounts() {
     message.success('保存成功')
     setDetailModalOpen(false)
     load()
+  }
+
+  const showCpaSyncResult = (title: string, result: any) => {
+    const lines = (result.items || [])
+      .flatMap((item: any) =>
+        (item.results || []).map((syncResult: any) => ({
+          email: item.email,
+          platform: item.platform,
+          ok: Boolean(syncResult.ok),
+          name: syncResult.name || 'CPA',
+          msg: syncResult.msg || '',
+        })),
+      )
+      .filter((item: any) => !item.ok)
+      .map((item: any) => `[${item.platform}] ${item.email || '-'} / ${item.name}: ${item.msg || '失败'}`)
+
+    if (lines.length === 0) return
+
+    Modal.info({
+      title,
+      width: 760,
+      content: (
+        <pre
+          style={{
+            margin: 0,
+            maxHeight: 360,
+            overflow: 'auto',
+            padding: 12,
+            borderRadius: 8,
+            background: 'rgba(127,127,127,0.08)',
+            fontSize: 12,
+            lineHeight: 1.5,
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+          }}
+        >
+          {lines.join('\n')}
+        </pre>
+      ),
+    })
+  }
+
+  const handleCpaBackfill = async (mode: 'pending' | 'selected') => {
+    if (currentPlatform !== 'chatgpt') return
+
+    const body: Record<string, unknown> = {
+      platforms: ['chatgpt'],
+    }
+
+    if (mode === 'selected') {
+      const accountIds = Array.from(selectedRowKeys)
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+
+      if (accountIds.length === 0) {
+        message.warning('请先选择要上传的账号')
+        return
+      }
+      body.account_ids = accountIds
+    } else {
+      body.pending_only = true
+      if (filterStatus) body.status = filterStatus
+      if (search) body.email = search
+    }
+
+    setCpaSyncLoading(mode)
+    try {
+      const result = await apiFetch('/integrations/backfill', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+
+      const actionLabel = mode === 'selected' ? '所选账号 CPA 上传' : '未上传账号 CPA 补传'
+      if (!result.total) {
+        message.info('没有可处理的账号')
+      } else if (!result.failed) {
+        message.success(`${actionLabel}完成：成功 ${result.success} / ${result.total}`)
+      } else if (!result.success) {
+        message.error(`${actionLabel}失败：成功 ${result.success} / ${result.total}`)
+      } else {
+        message.warning(`${actionLabel}部分完成：成功 ${result.success} / ${result.total}`)
+      }
+
+      showCpaSyncResult(`${actionLabel}结果`, result)
+      await load()
+    } catch (e: any) {
+      message.error(`CPA 上传失败: ${e.message}`)
+    } finally {
+      setCpaSyncLoading('')
+    }
   }
 
   const columns: any[] = [
@@ -429,6 +649,37 @@ export default function Accounts() {
     },
   ]
 
+  if (currentPlatform === 'chatgpt') {
+    columns.splice(4, 0, {
+      title: 'CPA',
+      key: 'cpa_sync',
+      render: (_: any, record: any) => {
+        const sync = record.cpaSync || {}
+        const uploaded = Boolean(sync.uploaded || sync.uploaded_at)
+        const attempted = Boolean(sync.last_attempt_at)
+        const color = uploaded ? 'success' : attempted ? 'error' : 'default'
+        const label = uploaded ? '已上传' : attempted ? '最近失败' : '未上传'
+        const time = uploaded ? sync.uploaded_at : sync.last_attempt_at
+
+        return (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 140 }}>
+            <Tag color={color}>{label}</Tag>
+            {time ? (
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {formatSyncTime(time)}
+              </Text>
+            ) : null}
+            {sync.last_message ? (
+              <Text type="secondary" ellipsis={{ tooltip: sync.last_message }} style={{ maxWidth: 220, fontSize: 12 }}>
+                {sync.last_message}
+              </Text>
+            ) : null}
+          </div>
+        )
+      },
+    })
+  }
+
   return (
     <div>
       <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
@@ -458,6 +709,26 @@ export default function Accounts() {
           )}
         </Space>
         <Space>
+          {currentPlatform === 'chatgpt' && selectedRowKeys.length > 0 && (
+            <Popconfirm
+              title={`确认上传选中的 ${selectedRowKeys.length} 个账号到 CPA？`}
+              onConfirm={() => handleCpaBackfill('selected')}
+            >
+              <Button loading={cpaSyncLoading === 'selected'} icon={<UploadOutlined />}>
+                上传所选 CPA
+              </Button>
+            </Popconfirm>
+          )}
+          {currentPlatform === 'chatgpt' && (
+            <Popconfirm
+              title="确认补传当前筛选范围内尚未成功上传 CPA 的账号？"
+              onConfirm={() => handleCpaBackfill('pending')}
+            >
+              <Button loading={cpaSyncLoading === 'pending'} icon={<UploadOutlined />} disabled={total === 0}>
+                补传未上传 CPA
+              </Button>
+            </Popconfirm>
+          )}
           {selectedRowKeys.length > 0 && (
             <Popconfirm title={`确认删除选中的 ${selectedRowKeys.length} 个账号？`} onConfirm={handleBatchDelete}>
               <Button danger icon={<DeleteOutlined />}>删除 {selectedRowKeys.length} 个</Button>
