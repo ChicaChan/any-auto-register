@@ -671,16 +671,36 @@ class RefreshTokenRegistrationEngine:
                     )
                 )
                 if should_retry:
-                    self._log("密码注册命中 400/403，刷新 Sentinel token 后重试一次...", "warning")
+                    self._log("密码注册命中 400/403，按 Browser -> VM 顺序重试 Sentinel token...", "warning")
                     retry_headers = self._build_json_headers(
                         referer="https://auth.openai.com/create-account/password",
                         include_device_id=True,
                         include_datadog=True,
                     )
-                    retry_token = self._check_sentinel(
-                        self._device_id or "",
+                    did = self._device_id or ""
+                    self._log("密码注册重试: Sentinel 先尝试 Browser", "warning")
+                    retry_token = get_sentinel_token_via_browser(
                         flow="username_password_create",
+                        proxy=self.proxy_url,
+                        headless=self.browser_mode != "headed",
+                        device_id=did,
+                        log_fn=lambda msg: self._log(msg),
                     )
+                    if retry_token:
+                        self._log("密码注册重试: Sentinel Browser token 获取成功", "warning")
+                    else:
+                        self._log("密码注册重试: Sentinel Browser 失败，尝试 VM", "warning")
+                        retry_token = build_sentinel_token_vm_only(
+                            self.session,
+                            did,
+                            flow="username_password_create",
+                        )
+                        if retry_token:
+                            self._log("密码注册重试: Sentinel VM token 获取成功", "warning")
+                        else:
+                            self._log("密码注册重试: Sentinel VM token 获取失败，判定失败", "warning")
+                            return False, None
+
                     if retry_token:
                         retry_headers["openai-sentinel-token"] = retry_token
                     retry_response = self.session.post(
@@ -694,6 +714,8 @@ class RefreshTokenRegistrationEngine:
                         return True, password
                     error_text = retry_response.text[:500]
                     self._log(f"密码注册重试失败: {error_text}", "warning")
+                    if retry_response.status_code in (400, 403):
+                        self._log("密码注册重试后仍为 400/403，按策略判定失败", "warning")
 
                 # 解析错误信息，判断是否是邮箱已注册
                 try:
