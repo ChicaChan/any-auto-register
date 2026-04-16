@@ -1,38 +1,53 @@
-"""
-Grok (x.ai) 自动注册
+"""Grok (x.ai) registration flow based on DrissionPage."""
 
-当前链路改为浏览器辅助注册：
-1. 邮箱收码
-2. 浏览器推进到完成注册页
-3. 点击真实 Turnstile 复选框拿 token
-4. 完成注册并接受 ToS
-5. 提取 sso / sso-rw cookie
-"""
+from __future__ import annotations
 
-import ctypes
+import html as html_lib
+import os
 import random
+import shutil
 import string
+import sys
 import time
-from typing import Any, Callable, Optional, Tuple
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Optional
 
-from core.browser_runtime import (
-    ensure_browser_display_available,
-    resolve_browser_headless,
-)
+from DrissionPage import Chromium, ChromiumOptions
+from DrissionPage.errors import PageDisconnectedError
 
-
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+from core.browser_runtime import ensure_browser_display_available, resolve_browser_headless
 
 
-def _rand_name(n: int = 6) -> str:
-    return "".join(random.choices(string.ascii_lowercase, k=n)).capitalize()
+SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+BROWSER_TIMEOUT_BASE = 1
+BROWSER_WINDOW_WIDTH = 1280
+BROWSER_WINDOW_HEIGHT = 800
+EMAIL_STEP_TIMEOUT = 15
+OTP_STEP_TIMEOUT = 180
+PROFILE_STEP_TIMEOUT = 120
+SSO_COOKIE_TIMEOUT = 120
+ANTI_DETECTION_MIN_DELAY = 0.5
+ANTI_DETECTION_MAX_DELAY = 2.0
+BROWSER_LAUNCH_ARGS = ["--incognito"]
+TURNSTILE_EXTENSION_NAME = "turnstilePatch"
+TURNSTILE_MOUSE_PATCH_SCRIPT = """function getRandomInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+let screenX = getRandomInt(800, 1200);
+let screenY = getRandomInt(400, 600);
+Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
+Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });"""
+TURNSTILE_CHALLENGE_PATCH_SCRIPT = "window.dtp = 1;\n" + TURNSTILE_MOUSE_PATCH_SCRIPT
+DEFAULT_FAILURE_HOLD_SECONDS = 45
 
 
-def _rand_password(n: int = 12) -> str:
-    return "".join(random.choices(string.ascii_letters + string.digits, k=n)) + ",,,aA1"
+def _rand_name(length: int = 6) -> str:
+    return "".join(random.choices(string.ascii_lowercase, k=length)).capitalize()
+
+
+def _rand_password(length: int = 12) -> str:
+    return "".join(random.choices(string.ascii_letters + string.digits, k=length)) + ",,,aA1"
 
 
 class GrokRegister:
@@ -43,291 +58,1020 @@ class GrokRegister:
         proxy=None,
         log_fn=print,
         headless: bool = False,
+        keep_browser_open_on_failure: Optional[bool] = None,
+        failure_hold_seconds: Optional[int] = None,
     ):
         self.captcha_solver = captcha_solver
         self.key = yescaptcha_key
         self.proxy = proxy
         self.log = log_fn
-        self.headless = headless
+        self.requested_headless = bool(headless)
+        self.browser_headless = False
+        self.browser: Chromium | None = None
+        self.page = None
+        self.co: ChromiumOptions | None = None
 
-    def _wait_until(
-        self,
-        fn: Callable[[], bool],
-        timeout: float = 30.0,
-        interval: float = 0.5,
-        desc: str = "",
-    ):
-        start = time.time()
-        while time.time() - start < timeout:
+        if keep_browser_open_on_failure is None:
+            keep_browser_open_on_failure = not self.requested_headless
+        self.keep_browser_open_on_failure = bool(keep_browser_open_on_failure)
+        if failure_hold_seconds is None:
+            failure_hold_seconds = (
+                DEFAULT_FAILURE_HOLD_SECONDS if self.keep_browser_open_on_failure else 0
+            )
+        self.failure_hold_seconds = max(0, int(failure_hold_seconds or 0))
+        self._init_browser_config()
+
+    @staticmethod
+    def _turnstile_extension_path() -> Path:
+        return (
+            Path(__file__).resolve().parent
+            / "extensions"
+            / TURNSTILE_EXTENSION_NAME
+        )
+
+    @staticmethod
+    def _browser_path_candidates() -> list[str]:
+        candidates = [os.getenv("GROK_BROWSER_PATH", "").strip(), os.getenv("CHROME_PATH", "").strip()]
+        if os.name == "nt":
+            for env_name in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+                base = os.getenv(env_name, "").strip()
+                if base:
+                    candidates.append(str(Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe"))
+        elif sys.platform == "darwin":
+            candidates.append("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+        else:
+            candidates.extend(
+                ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium-browser", "/usr/bin/chromium"]
+            )
+        for name in ("chrome", "google-chrome", "google-chrome-stable", "chromium-browser", "chromium"):
+            resolved = shutil.which(name)
+            if resolved:
+                candidates.append(resolved)
+        uniq: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            val = str(item or "").strip()
+            if val and val not in seen:
+                uniq.append(val)
+                seen.add(val)
+        return uniq
+
+    @classmethod
+    def _resolve_browser_path(cls) -> str:
+        for candidate in cls._browser_path_candidates():
+            if Path(candidate).exists():
+                return candidate
+        return ""
+
+    def _init_browser_config(self) -> None:
+        self.co = ChromiumOptions()
+        self.co.auto_port()
+        self.co.set_timeouts(base=BROWSER_TIMEOUT_BASE)
+        headless, reason = resolve_browser_headless(
+            self.requested_headless,
+            default_headless=False,
+            override_env_names=("GROK_HEADLESS", "PLAYWRIGHT_HEADLESS", "REGISTER_HEADLESS"),
+        )
+        ensure_browser_display_available(headless)
+        self.browser_headless = bool(headless)
+        self.log(f"browser mode: {'headless' if headless else 'headed'} ({reason})")
+
+        extension_path = self._turnstile_extension_path()
+        if not extension_path.exists():
+            raise RuntimeError(f"missing turnstile extension: {extension_path}")
+        self.co.add_extension(str(extension_path))
+
+        browser_path = self._resolve_browser_path()
+        if browser_path:
+            self.co.set_browser_path(browser_path)
+            self.log(f"browser path: {browser_path}")
+
+        self.co.set_argument(f"--window-size={BROWSER_WINDOW_WIDTH},{BROWSER_WINDOW_HEIGHT}")
+        for arg in BROWSER_LAUNCH_ARGS:
+            self.co.set_argument(arg)
+        if headless:
+            self.co.set_argument("--headless=new")
+        if self.proxy:
+            self.co.set_proxy(self.proxy)
+
+    def _wait_until(self, fn: Callable[[], bool], timeout: float = 30.0, interval: float = 0.5, desc: str = "") -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
             if fn():
                 return
             time.sleep(interval)
-        raise TimeoutError(desc or "等待超时")
+        raise TimeoutError(desc or "wait timeout")
 
     @staticmethod
-    def _has_auth_cookies(cookies: list) -> bool:
-        return any(cookie.get("name") in {"sso", "sso-rw"} for cookie in cookies)
-
-    def _launch_browser(self):
-        from patchright.sync_api import sync_playwright
-
-        playwright = sync_playwright().start()
-        headless, reason = resolve_browser_headless(
-            self.headless, default_headless=False
-        )
-        ensure_browser_display_available(headless)
-        self.log(f"浏览器模式: {'headless' if headless else 'headed'} ({reason})")
-        launch_kwargs: dict[str, Any] = {
-            "headless": headless,
-            "channel": "msedge",
-        }
-        if self.proxy:
-            launch_kwargs["proxy"] = {"server": self.proxy}
+    def _current_url(page) -> str:
         try:
-            browser = playwright.chromium.launch(**launch_kwargs)
+            return str(getattr(page, "url", "") or "")
         except Exception:
-            launch_kwargs.pop("channel", None)
-            browser = playwright.chromium.launch(**launch_kwargs)
-        return playwright, browser
+            return ""
 
-    def _goto_email_signup(self, page) -> None:
-        self.log("Step1: 打开 Grok 注册页...")
-        page.goto("https://accounts.x.ai/sign-up", wait_until="domcontentloaded")
-        page.wait_for_timeout(1500)
-        if page.locator("input[type=email]").count() == 0:
-            clicked = page.evaluate(
-                """() => {
-                    const buttons = [...document.querySelectorAll('button')];
-                    const target =
-                      buttons.find((b) => /邮箱|email/i.test((b.innerText || '').trim())) ||
-                      buttons[1] ||
-                      null;
-                    if (target) {
-                      target.click();
-                      return true;
-                    }
-                    return false;
-                }"""
+    @staticmethod
+    def _body_text(page) -> str:
+        try:
+            return str(page.run_js("return document.body ? document.body.innerText : '';") or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _page_title(page) -> str:
+        try:
+            title = getattr(page, "title", "")
+            if callable(title):
+                title = title()
+            return str(title or "")
+        except Exception:
+            return ""
+
+    def _random_delay(
+        self,
+        min_delay: float = ANTI_DETECTION_MIN_DELAY,
+        max_delay: float = ANTI_DETECTION_MAX_DELAY,
+    ) -> None:
+        time.sleep(random.uniform(min_delay, max_delay))
+
+    def start_browser(self):
+        self.log("starting DrissionPage Chrome")
+        self.browser = Chromium(self.co)
+        self.page = self.refresh_active_page()
+        if self._current_url(self.page).startswith("chrome://settings/triggeredResetProfileSettings"):
+            self.page = self.browser.new_tab(SIGNUP_URL)
+        return self.page
+
+    def stop_browser(self) -> None:
+        if self.browser is not None:
+            try:
+                self.browser.quit()
+            except Exception:
+                pass
+        self.browser = None
+        self.page = None
+
+    def refresh_active_page(self):
+        if self.browser is None:
+            raise RuntimeError("browser is not started")
+        tabs = self.browser.get_tabs() or []
+        preferred = None
+        for tab in tabs:
+            url = self._current_url(tab)
+            if "accounts.x.ai" in url or "grok.com" in url or "x.ai" in url:
+                preferred = tab
+                break
+        if preferred is None:
+            for tab in tabs:
+                if not self._current_url(tab).startswith("chrome://"):
+                    preferred = tab
+                    break
+        if preferred is None:
+            preferred = tabs[-1] if tabs else self.browser.new_tab()
+        self.page = preferred
+        if self._current_url(self.page).startswith("chrome://settings/triggeredResetProfileSettings"):
+            self.page = self.browser.new_tab(SIGNUP_URL)
+        return self.page
+
+    @staticmethod
+    def _apply_turnstile_mouse_patch(target) -> bool:
+        try:
+            target.run_js(TURNSTILE_CHALLENGE_PATCH_SCRIPT)
+            return True
+        except Exception:
+            return False
+
+    def _raise_if_cloudflare_gate(self, page) -> None:
+        body = self._body_text(page).strip().lower()
+        if "blocked due to abusive traffic patterns" in body:
+            raise RuntimeError("grok signup blocked by cloudflare")
+        if "attention required" in body and "cloudflare" in body:
+            raise RuntimeError("grok signup landed on cloudflare challenge")
+
+    @staticmethod
+    def _debug_output_dir() -> Path:
+        return Path(__file__).resolve().parents[2] / "runtime-logs" / "grok-failures"
+
+    def _dump_debug_artifacts(self, page, reason: str = "failure") -> list[str]:
+        saved: list[str] = []
+        try:
+            out_dir = self._debug_output_dir()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            base = out_dir / f"{stamp}-{reason}"
+            current_url = self._current_url(page)
+            page_title = self._page_title(page)
+            body_text = self._body_text(page)
+
+            screenshot_path = base.with_suffix(".png")
+            try:
+                page.get_screenshot(path=str(screenshot_path))
+                saved.append(str(screenshot_path))
+            except Exception:
+                pass
+
+            html_path = base.with_suffix(".html")
+            html = ""
+            try:
+                html = str(page.html or "")
+            except Exception:
+                pass
+            if not html:
+                try:
+                    html = str(page.run_js("return document.documentElement.outerHTML;") or "")
+                except Exception:
+                    html = ""
+            if not html:
+                fallback_text = (
+                    f"reason: {reason}\n"
+                    f"url: {current_url}\n"
+                    f"title: {page_title}\n\n"
+                    f"{body_text}"
+                )
+                html = f"<html><body><pre>{html_lib.escape(fallback_text)}</pre></body></html>"
+            html_path.write_text(html, encoding="utf-8")
+            saved.append(str(html_path))
+
+            text_path = base.with_suffix(".txt")
+            text_path.write_text(
+                "\n".join(
+                    [
+                        f"reason: {reason}",
+                        f"url: {current_url}",
+                        f"title: {page_title}",
+                        "",
+                        body_text,
+                    ]
+                ),
+                encoding="utf-8",
             )
-            if not clicked:
-                raise RuntimeError("未找到邮箱注册入口按钮")
-            page.wait_for_timeout(2000)
-        page.locator("input[type=email]").wait_for(state="visible", timeout=10000)
+            saved.append(str(text_path))
+        except Exception as exc:
+            self.log(f"debug artifact dump failed: {exc}")
+        return saved
+
+    def _hold_browser_for_debug(self) -> None:
+        if self.browser_headless or not self.keep_browser_open_on_failure or self.failure_hold_seconds <= 0:
+            return
+        self.log(f"hold browser for debug: {self.failure_hold_seconds}s")
+        time.sleep(self.failure_hold_seconds)
+
+    def open_signup_page(self):
+        self.log("step1: open signup page")
+        page = self.refresh_active_page()
+        try:
+            page.get(SIGNUP_URL)
+        except Exception:
+            page = self.browser.new_tab(SIGNUP_URL)
+            self.page = page
+        self._random_delay()
+        self._raise_if_cloudflare_gate(page)
+        self.click_email_signup_button()
+        return self.page
+
+    def click_email_signup_button(self, timeout: int = 20) -> None:
+        script = r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+const target = candidates.find((node) => {
+    if (!isVisible(node) || node.disabled || node.getAttribute('aria-disabled') === 'true') return false;
+    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
+    return text.includes('使用邮箱注册') || text.includes('邮箱注册') || text.includes('email');
+});
+if (!target) return false;
+target.click();
+return true;
+"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            page = self.refresh_active_page()
+            if bool(page.run_js(script)):
+                self._random_delay(0.5, 1.2)
+                return
+            time.sleep(0.5)
+        raise RuntimeError("email signup entry not found")
 
     def _submit_email(self, page, email: str) -> None:
-        self.log(f"Step2: 提交邮箱 {email} ...")
-        page.locator("input[type=email]").fill(email)
-        page.locator("button[type=submit]").click()
+        self.log(f"step2: submit email {email}")
+        deadline = time.time() + EMAIL_STEP_TIMEOUT
+        while time.time() < deadline:
+            self._raise_if_cloudflare_gate(page)
+            filled = page.run_js(
+                """
+const email = arguments[0];
 
-        def _email_verify_ready() -> bool:
-            return page.locator("input[name=code]").count() > 0
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
 
-        try:
-            self._wait_until(
-                _email_verify_ready, timeout=15, desc="等待邮箱验证码页超时"
+const input = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]')).find((node) => {
+    return isVisible(node) && !node.disabled && !node.readOnly;
+}) || null;
+
+if (!input) {
+    return 'not-ready';
+}
+
+input.focus();
+input.click();
+
+const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+const tracker = input._valueTracker;
+if (tracker) {
+    tracker.setValue('');
+}
+if (valueSetter) {
+    valueSetter.call(input, email);
+} else {
+    input.value = email;
+}
+
+input.dispatchEvent(new InputEvent('beforeinput', {
+    bubbles: true,
+    data: email,
+    inputType: 'insertText',
+}));
+input.dispatchEvent(new InputEvent('input', {
+    bubbles: true,
+    data: email,
+    inputType: 'insertText',
+}));
+input.dispatchEvent(new Event('change', { bubbles: true }));
+
+if ((input.value || '').trim() !== email || !input.checkValidity()) {
+    return false;
+}
+
+input.blur();
+return 'filled';
+                """,
+                email,
             )
-        except Exception:
-            body = page.locator("body").inner_text()
-            if any(
-                x in body
-                for x in ["域名", "已被拒绝", "其他邮箱地址", "disposable", "rejected"]
-            ):
-                raise RuntimeError(f"邮箱域名被拒绝: {body[:200]}")
-            raise RuntimeError(f"邮箱提交失败: {body[:200]}")
+
+            if filled == "not-ready":
+                time.sleep(0.5)
+                continue
+
+            if filled != "filled":
+                time.sleep(0.5)
+                continue
+
+            self._random_delay()
+            clicked = page.run_js(
+                r"""
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+const input = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]')).find((node) => {
+    return isVisible(node) && !node.disabled && !node.readOnly;
+}) || null;
+
+if (!input || !input.checkValidity() || !(input.value || '').trim()) {
+    return false;
+}
+
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
+    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+});
+const submitButton = buttons.find((node) => {
+    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
+    return text === '注册' || text.includes('注册');
+});
+
+if (!submitButton || submitButton.disabled) {
+    return false;
+}
+
+submitButton.click();
+return true;
+                """
+            )
+
+            if clicked:
+                self.log(f"email submitted: {email}")
+                return
+
+            time.sleep(0.5)
+
+        raise RuntimeError("email input or submit button not found")
 
     def _submit_otp(self, page, code: str) -> None:
-        self.log(f"Step3: 提交邮箱验证码 {code} ...")
-        otp_input = page.locator("input[name=code]")
-        otp_input.click()
-        try:
-            otp_input.press("Control+A")
-        except Exception:
-            pass
-        otp_input.type(code, delay=120)
-        page.wait_for_timeout(1500)
-        submit_disabled = page.evaluate(
-            "() => !!document.querySelector('button[type=submit]')?.disabled"
-        )
-        if not submit_disabled:
-            page.locator("button[type=submit]").click()
-        else:
-            otp_input.press("Enter")
+        self.log(f"step3: submit otp {code}")
+        if self.has_profile_form():
+            return
 
-        def _user_form_ready() -> bool:
-            return page.locator("input[name=givenName]").count() > 0
+        normalized = str(code or "").strip().upper()
+        if not normalized:
+            raise RuntimeError("otp is empty")
 
-        self._wait_until(_user_form_ready, timeout=20, desc="等待完成注册页超时")
-        self.log("  已进入完成注册页")
+        deadline = time.time() + OTP_STEP_TIMEOUT
+        while time.time() < deadline:
+            self._raise_if_cloudflare_gate(page)
+            if self.has_profile_form():
+                return
 
-    def _fill_user_form(
-        self, page, given_name: str, family_name: str, password: str
-    ) -> None:
-        self.log(f"Step4: 填写用户信息 {given_name} {family_name} ...")
-        page.locator("input[name=givenName]").fill(given_name)
-        page.locator("input[name=familyName]").fill(family_name)
-        page.locator("input[name=password]").fill(password)
-
-    @staticmethod
-    def _find_turnstile_widget(
-        page,
-    ) -> Tuple[Optional[Any], Optional[dict[str, Any]]]:
-        for frame in page.frames:
-            if "challenges.cloudflare.com" not in frame.url:
-                continue
             try:
-                frame_el = frame.frame_element()
-                box = frame_el.bounding_box()
+                filled = page.run_js(
+                    """
+const rawCode = String(arguments[0] || '').trim().toUpperCase();
+const compactCode = rawCode.replace(/[^A-Z0-9]/g, '');
+const dashedCode = compactCode.length === 6 ? `${compactCode.slice(0, 3)}-${compactCode.slice(3)}` : rawCode;
+const candidateCodes = Array.from(new Set([rawCode, dashedCode, compactCode].filter(Boolean)));
+
+if (!compactCode) {
+    return 'invalid-code';
+}
+
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+function setNativeValue(input, value) {
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    const tracker = input._valueTracker;
+    if (tracker) {
+        tracker.setValue('');
+    }
+    if (nativeInputValueSetter) {
+        nativeInputValueSetter.call(input, '');
+        nativeInputValueSetter.call(input, value);
+    } else {
+        input.value = '';
+        input.value = value;
+    }
+}
+
+function dispatchInputEvents(input, value) {
+    input.dispatchEvent(new InputEvent('beforeinput', {
+        bubbles: true,
+        cancelable: true,
+        data: value,
+        inputType: 'insertText',
+    }));
+    input.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        data: value,
+        inputType: 'insertText',
+    }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+const input = Array.from(document.querySelectorAll('input[data-input-otp="true"], input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[inputmode="text"]')).find((node) => {
+    return isVisible(node) && !node.disabled && !node.readOnly && Number(node.maxLength || compactCode.length || 6) > 1;
+}) || null;
+
+const otpBoxes = Array.from(document.querySelectorAll('input')).filter((node) => {
+    if (!isVisible(node) || node.disabled || node.readOnly) {
+        return false;
+    }
+    const maxLength = Number(node.maxLength || 0);
+    const autocomplete = String(node.autocomplete || '').toLowerCase();
+    return maxLength === 1 || autocomplete === 'one-time-code';
+});
+
+if (!input && otpBoxes.length < compactCode.length) {
+    return 'not-ready';
+}
+
+if (input) {
+    let accepted = false;
+    let finalValue = '';
+    const expectedLength = Number(input.maxLength || 0);
+
+    for (const candidate of candidateCodes) {
+        input.focus();
+        input.click();
+        setNativeValue(input, candidate);
+        dispatchInputEvents(input, candidate);
+
+        const normalizedValue = String(input.value || '').trim().toUpperCase();
+        const normalizedCompact = normalizedValue.replace(/[^A-Z0-9]/g, '');
+        const lengthOk = expectedLength <= 0 || normalizedValue.length === expectedLength || normalizedCompact.length === expectedLength;
+        if (normalizedCompact === compactCode && lengthOk) {
+            accepted = true;
+            finalValue = normalizedValue;
+            break;
+        }
+    }
+
+    if (!accepted) {
+        return 'aggregate-mismatch';
+    }
+
+    const slots = Array.from(document.querySelectorAll('[data-input-otp-slot="true"]'));
+    const filledSlots = slots.filter((slot) => (slot.textContent || '').trim()).length;
+
+    if (slots.length && filledSlots && filledSlots !== compactCode.length && filledSlots !== finalValue.length) {
+        return 'aggregate-slot-mismatch';
+    }
+
+    input.blur();
+    return 'filled';
+}
+
+const orderedBoxes = otpBoxes.slice(0, compactCode.length);
+for (let i = 0; i < orderedBoxes.length; i += 1) {
+    const box = orderedBoxes[i];
+    const char = compactCode[i] || '';
+    box.focus();
+    box.click();
+    setNativeValue(box, char);
+    dispatchInputEvents(box, char);
+    box.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: char }));
+    box.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: char }));
+    box.blur();
+}
+
+const merged = orderedBoxes.map((node) => String(node.value || '').trim()).join('');
+return merged.toUpperCase() === compactCode ? 'filled' : 'box-mismatch';
+                    """,
+                    normalized,
+                )
+            except PageDisconnectedError:
+                self.refresh_active_page()
+                if self.has_profile_form():
+                    return
+                time.sleep(1)
+                continue
+
+            if filled == "not-ready":
+                if self.has_profile_form():
+                    return
+                time.sleep(0.5)
+                continue
+
+            if filled != "filled":
+                time.sleep(0.5)
+                continue
+
+            self._random_delay(1, 2)
+            try:
+                clicked = page.run_js(
+                    r"""
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+const aggregateInput = Array.from(document.querySelectorAll('input[data-input-otp="true"], input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[inputmode="text"]')).find((node) => {
+    return isVisible(node) && !node.disabled && !node.readOnly && Number(node.maxLength || 0) > 1;
+}) || null;
+
+let value = '';
+if (aggregateInput) {
+    value = String(aggregateInput.value || '').trim();
+    const expectedLength = Number(aggregateInput.maxLength || value.length || 6);
+    if (!value || (expectedLength > 0 && value.length !== expectedLength)) {
+        return false;
+    }
+
+    const slots = Array.from(document.querySelectorAll('[data-input-otp-slot="true"]'));
+    if (slots.length) {
+        const filledSlots = slots.filter((slot) => (slot.textContent || '').trim()).length;
+        if (filledSlots && filledSlots !== value.length) {
+            return false;
+        }
+    }
+} else {
+    const otpBoxes = Array.from(document.querySelectorAll('input')).filter((node) => {
+        if (!isVisible(node) || node.disabled || node.readOnly) {
+            return false;
+        }
+        const maxLength = Number(node.maxLength || 0);
+        const autocomplete = String(node.autocomplete || '').toLowerCase();
+        return maxLength === 1 || autocomplete === 'one-time-code';
+    });
+    value = otpBoxes.map((node) => String(node.value || '').trim()).join('');
+    if (!value || value.length < 6) {
+        return false;
+    }
+}
+
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
+    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+});
+const confirmButton = buttons.find((node) => {
+    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
+    return text === '确认邮箱' || text.includes('确认邮箱') || text === '继续' || text.includes('继续') || text === '下一步' || text.includes('下一步') || text === 'Confirmemail' || text.includes('Confirm');
+});
+
+if (!confirmButton) {
+    return 'no-button';
+}
+
+confirmButton.focus();
+confirmButton.click();
+return 'clicked';
+                    """
+                )
+            except PageDisconnectedError:
+                self.refresh_active_page()
+                if self.has_profile_form():
+                    return
+                clicked = "disconnected"
+
+            if clicked == "clicked":
+                self._random_delay(2, 3)
+                self.refresh_active_page()
+                if self.has_profile_form():
+                    return
+                return
+
+            if clicked == "no-button":
+                current_url = self._current_url(self.page)
+                if self.has_profile_form():
+                    return
+                if "sign-up" in current_url or "signup" in current_url:
+                    return
+
+            if clicked == "disconnected":
+                time.sleep(1)
+                continue
+
+            time.sleep(0.5)
+
+        if self.has_profile_form():
+            return
+
+        raise RuntimeError(f"otp input or confirm button not found (url: {self._current_url(self.page)})")
+
+    def has_profile_form(self) -> bool:
+        page = self.refresh_active_page()
+        try:
+            return bool(
+                page.run_js(
+                    """
+const givenInput = document.querySelector('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]');
+const familyInput = document.querySelector('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]');
+const passwordInput = document.querySelector('input[data-testid="password"], input[name="password"], input[type="password"]');
+return !!(givenInput && familyInput && passwordInput);
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    def _build_profile(
+        self,
+        given_name: str,
+        family_name: str,
+        password: str,
+    ) -> dict[str, str]:
+        return {
+            "given_name": given_name,
+            "family_name": family_name,
+            "password": password,
+        }
+
+    def _fill_profile_and_submit(
+        self,
+        page,
+        given_name: str,
+        family_name: str,
+        password: str,
+        timeout: int = PROFILE_STEP_TIMEOUT,
+    ) -> dict[str, str]:
+        self.log(f"step4: fill profile and submit {given_name} {family_name}")
+        deadline = time.time() + timeout
+        turnstile_token = ""
+
+        while time.time() < deadline:
+            self._raise_if_cloudflare_gate(page)
+            filled = page.run_js(
+                """
+const givenName = arguments[0];
+const familyName = arguments[1];
+const password = arguments[2];
+
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+function pickInput(selector) {
+    return Array.from(document.querySelectorAll(selector)).find((node) => {
+        return isVisible(node) && !node.disabled && !node.readOnly;
+    }) || null;
+}
+
+function setInputValue(input, value) {
+    if (!input) {
+        return false;
+    }
+    input.focus();
+    input.click();
+
+    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    const tracker = input._valueTracker;
+    if (tracker) {
+        tracker.setValue('');
+    }
+
+    if (nativeSetter) {
+        nativeSetter.call(input, '');
+        nativeSetter.call(input, value);
+    } else {
+        input.value = '';
+        input.value = value;
+    }
+
+    input.dispatchEvent(new InputEvent('beforeinput', {
+        bubbles: true,
+        cancelable: true,
+        data: value,
+        inputType: 'insertText',
+    }));
+    input.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        data: value,
+        inputType: 'insertText',
+    }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    input.dispatchEvent(new Event('blur', { bubbles: true }));
+
+    return String(input.value || '') === String(value || '');
+}
+
+const givenInput = pickInput('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]');
+const familyInput = pickInput('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]');
+const passwordInput = pickInput('input[data-testid="password"], input[name="password"], input[type="password"]');
+
+if (!givenInput || !familyInput || !passwordInput) {
+    return 'not-ready';
+}
+
+const givenOk = setInputValue(givenInput, givenName);
+const familyOk = setInputValue(familyInput, familyName);
+const passwordOk = setInputValue(passwordInput, password);
+
+if (!givenOk || !familyOk || !passwordOk) {
+    return 'filled-failed';
+}
+
+return [
+    String(givenInput.value || '').trim() === String(givenName || '').trim(),
+    String(familyInput.value || '').trim() === String(familyName || '').trim(),
+    String(passwordInput.value || '') === String(password || ''),
+].every(Boolean) ? 'filled' : 'verify-failed';
+                """,
+                given_name,
+                family_name,
+                password,
+            )
+
+            if filled == "not-ready":
+                time.sleep(0.5)
+                continue
+
+            if filled != "filled":
+                time.sleep(0.5)
+                continue
+
+            values_ok = page.run_js(
+                """
+const expectedGiven = arguments[0];
+const expectedFamily = arguments[1];
+const expectedPassword = arguments[2];
+
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+function pickInput(selector) {
+    return Array.from(document.querySelectorAll(selector)).find((node) => {
+        return isVisible(node) && !node.disabled && !node.readOnly;
+    }) || null;
+}
+
+const givenInput = pickInput('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]');
+const familyInput = pickInput('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]');
+const passwordInput = pickInput('input[data-testid="password"], input[name="password"], input[type="password"]');
+
+if (!givenInput || !familyInput || !passwordInput) {
+    return false;
+}
+
+return String(givenInput.value || '').trim() === String(expectedGiven || '').trim()
+    && String(familyInput.value || '').trim() === String(expectedFamily || '').trim()
+    && String(passwordInput.value || '') === String(expectedPassword || '');
+                """,
+                given_name,
+                family_name,
+                password,
+            )
+
+            if not values_ok:
+                time.sleep(0.5)
+                continue
+
+            turnstile_state = page.run_js(
+                """
+const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!challengeInput) {
+    return 'not-found';
+}
+const value = String(challengeInput.value || '').trim();
+return value ? 'ready' : 'pending';
+                """
+            )
+
+            if turnstile_state == "pending" and not turnstile_token:
+                try:
+                    turnstile_token = self._solve_turnstile_on_page(page)
+                except Exception:
+                    turnstile_token = ""
+
+                if turnstile_token:
+                    synced = page.run_js(
+                        """
+const token = arguments[0];
+const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!challengeInput) {
+    return false;
+}
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+if (nativeSetter) {
+    nativeSetter.call(challengeInput, token);
+} else {
+    challengeInput.value = token;
+}
+challengeInput.dispatchEvent(new Event('input', { bubbles: true }));
+challengeInput.dispatchEvent(new Event('change', { bubbles: true }));
+return String(challengeInput.value || '').trim() === String(token || '').trim();
+                        """,
+                        turnstile_token,
+                    )
+                    if synced:
+                        self.log("turnstile token synced to profile form")
+
+            self._random_delay(1, 2)
+
+            try:
+                submit_button = page.ele("tag:button@@text()=完成注册")
             except Exception:
-                box = None
-            if box and box["width"] > 100 and box["height"] >= 50:
-                return frame, box
-        return None, None
+                submit_button = None
+
+            if not submit_button:
+                clicked = page.run_js(
+                    r"""
+const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (challengeInput && !String(challengeInput.value || '').trim()) {
+    return false;
+}
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
+const submitButton = buttons.find((node) => {
+    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
+    return text === '完成注册' || text.includes('完成注册');
+});
+if (!submitButton || submitButton.disabled || submitButton.getAttribute('aria-disabled') === 'true') {
+    return false;
+}
+submitButton.focus();
+submitButton.click();
+return true;
+                    """
+                )
+            else:
+                challenge_value = page.run_js(
+                    """
+const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
+return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
+                    """
+                )
+                if challenge_value not in ("not-found", ""):
+                    submit_button.click()
+                    clicked = True
+                else:
+                    clicked = False
+
+            if clicked:
+                self.log(f"profile submitted: {given_name} {family_name}")
+                return self._build_profile(given_name, family_name, password)
+
+            time.sleep(0.5)
+
+        raise RuntimeError("final register form or submit button not found")
 
     @staticmethod
     def _read_turnstile_token(page) -> str:
-        return page.evaluate(
-            """() => {
-                return (
-                    document.querySelector('input[id^="cf-chl-widget-"]')?.value ||
-                    document.querySelector('input[name="cf-turnstile-response"]')?.value ||
-                    ''
-                );
-            }"""
+        return str(
+            page.run_js(
+                """
+return (
+    (typeof window.turnstile !== 'undefined' && typeof window.turnstile.getResponse === 'function' && window.turnstile.getResponse())
+    || document.querySelector('input[id^="cf-chl-widget-"]')?.value
+    || document.querySelector('input[name="cf-turnstile-response"]')?.value
+    || ''
+);
+                """
+            )
+            or ""
         )
 
     @staticmethod
     def _read_turnstile_sitekey(page) -> str:
-        return page.evaluate(
-            """() => {
-                const byData = document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey');
-                if (byData) return byData;
-
-                for (const iframe of document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]')) {
-                    try {
-                        const u = new URL(iframe.src, location.href);
-                        const k = u.searchParams.get('k');
-                        if (k) return k;
-                    } catch (_) {}
-                }
-                return '';
-            }"""
+        return str(
+            page.run_js(
+                """
+const byData = document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey');
+if (byData) return byData;
+for (const iframe of document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]')) {
+    try {
+        const url = new URL(iframe.src, location.href);
+        const key = url.searchParams.get('k');
+        if (key) return key;
+    } catch (error) {}
+}
+return '';
+                """
+            )
+            or ""
         )
-
-    @staticmethod
-    def _has_turnstile_error(page) -> bool:
-        keywords = [
-            "验证失败",
-            "故障排除",
-            "verification failed",
-            "troubleshoot",
-            "try again",
-        ]
-        texts = []
-        try:
-            texts.append(page.locator("body").inner_text(timeout=800))
-        except Exception:
-            pass
-
-        for frame in page.frames:
-            if "challenges.cloudflare.com" not in frame.url:
-                continue
-            try:
-                texts.append(frame.locator("body").inner_text(timeout=500))
-            except Exception:
-                continue
-
-        merged = "\n".join(texts).lower()
-        return any(k.lower() in merged for k in keywords)
 
     @staticmethod
     def _inject_turnstile_token(page, token: str) -> bool:
         return bool(
-            page.evaluate(
-                """(token) => {
-                    const selectors = [
-                        'input[id^="cf-chl-widget-"]',
-                        'input[name="cf-turnstile-response"]',
-                        'textarea[name="cf-turnstile-response"]',
-                        'textarea[name="g-recaptcha-response"]',
-                    ];
-                    const inputs = [];
-                    for (const sel of selectors) {
-                        document.querySelectorAll(sel).forEach((el) => inputs.push(el));
-                    }
-                    if (!inputs.length) {
-                        const fallback = document.createElement('input');
-                        fallback.type = 'hidden';
-                        fallback.name = 'cf-turnstile-response';
-                        document.body.appendChild(fallback);
-                        inputs.push(fallback);
-                    }
-                    for (const el of inputs) {
-                        el.value = token;
-                        el.setAttribute('value', token);
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                    }
-                    return inputs.length > 0;
-                }""",
+            page.run_js(
+                """
+const token = arguments[0];
+const selectors = ['input[id^="cf-chl-widget-"]', 'input[name="cf-turnstile-response"]', 'textarea[name="cf-turnstile-response"]'];
+let touched = 0;
+for (const sel of selectors) {
+    document.querySelectorAll(sel).forEach((node) => {
+        node.value = token;
+        node.setAttribute('value', token);
+        node.dispatchEvent(new Event('input', { bubbles: true }));
+        node.dispatchEvent(new Event('change', { bubbles: true }));
+        touched += 1;
+    });
+}
+if (!touched) {
+    const fallback = document.createElement('input');
+    fallback.type = 'hidden';
+    fallback.name = 'cf-turnstile-response';
+    fallback.value = token;
+    document.body.appendChild(fallback);
+    touched += 1;
+}
+return touched > 0;
+                """,
                 token,
             )
         )
-
-    def _wait_turnstile_token(
-        self, page, wait_rounds: int = 25, wait_ms: int = 500
-    ) -> str:
-        for _ in range(wait_rounds):
-            token = self._read_turnstile_token(page)
-            if token and len(token) > 20:
-                return token
-            page.wait_for_timeout(wait_ms)
-        return ""
-
-    def _native_click_turnstile(self, page, box, offset_x: float) -> str:
-        try:
-            user32 = ctypes.windll.user32
-            try:
-                user32.SetProcessDPIAware()
-            except Exception:
-                pass
-        except Exception as e:
-            raise RuntimeError(f"当前系统不支持原生点击: {e}") from e
-
-        page.bring_to_front()
-        metrics = page.evaluate(
-            """() => ({
-                screenX,
-                screenY,
-                outerWidth,
-                outerHeight,
-                innerWidth,
-                innerHeight,
-                dpr: window.devicePixelRatio,
-            })"""
-        )
-
-        border_x = max(0, (metrics["outerWidth"] - metrics["innerWidth"]) / 2)
-        chrome_y = max(0, metrics["outerHeight"] - metrics["innerHeight"] - border_x)
-        raw_x = metrics["screenX"] + border_x + box["x"] + offset_x
-        raw_y = metrics["screenY"] + chrome_y + box["y"] + box["height"] / 2
-        dpr = float(metrics.get("dpr") or 1.0)
-        points = [(raw_x, raw_y)]
-        if abs(dpr - 1.0) > 0.05:
-            points.append((raw_x * dpr, raw_y * dpr))
-
-        for idx, (screen_x, screen_y) in enumerate(points, start=1):
-            self.log(f"  Native click #{idx}: ({screen_x:.1f}, {screen_y:.1f})")
-            user32.SetCursorPos(int(screen_x), int(screen_y))
-            time.sleep(0.15)
-            user32.mouse_event(0x0002, 0, 0, 0, 0)
-            time.sleep(0.12)
-            user32.mouse_event(0x0004, 0, 0, 0, 0)
-
-            token = self._wait_turnstile_token(page, wait_rounds=18, wait_ms=450)
-            if token:
-                return token
-
-        raise RuntimeError("Native click 后仍未获取到 token")
 
     def _solve_turnstile_by_solver(self, page) -> str:
         if not self.captcha_solver:
@@ -335,239 +1079,251 @@ class GrokRegister:
         solver_name = type(self.captcha_solver).__name__.lower()
         if "manual" in solver_name:
             return ""
-        client_key = getattr(self.captcha_solver, "client_key", None)
-        if client_key is not None and not str(client_key).strip():
-            self.log("  未配置 YesCaptcha key，跳过验证码服务兜底")
-            return ""
         sitekey = self._read_turnstile_sitekey(page)
         if not sitekey:
-            self.log("  未提取到 Turnstile sitekey，跳过验证码服务兜底")
             return ""
-        self.log(f"  兜底: 调用验证码服务解 Turnstile (sitekey={sitekey[:8]}...)")
-        token = self.captcha_solver.solve_turnstile(page.url, sitekey)
-        if not token:
-            return ""
-        if self._inject_turnstile_token(page, token):
-            page.wait_for_timeout(400)
-            return self._read_turnstile_token(page) or token
+        token = self.captcha_solver.solve_turnstile(self._current_url(page), sitekey)
+        if token and self._inject_turnstile_token(page, token):
+            return token
         return ""
 
     def _solve_turnstile_on_page(self, page) -> str:
-        self.log("Step5: 点击页面内 Turnstile 复选框...")
+        self.log("step5: solve turnstile")
         last_error = None
-        for attempt in range(8):
-            frame, box = self._find_turnstile_widget(page)
-            if not box:
-                page.wait_for_timeout(1000)
-                if last_error is None:
-                    last_error = "未找到可点击的 Turnstile iframe"
-                continue
-
-            click_x = box["x"] + min(28, max(18, box["width"] * 0.08))
-            click_y = box["y"] + box["height"] / 2
-            self.log(
-                f"  Turnstile click #{attempt + 1}: ({click_x:.1f}, {click_y:.1f})"
-            )
-            try:
-                if frame:
-                    frame.locator("body").click(
-                        position={
-                            "x": min(28, max(18, box["width"] * 0.08)),
-                            "y": box["height"] / 2,
-                        },
-                        timeout=2500,
-                    )
-                    page.wait_for_timeout(120)
-                page.mouse.move(click_x, click_y)
-                page.mouse.down()
-                page.wait_for_timeout(120)
-                page.mouse.up()
-                token = self._wait_turnstile_token(page, wait_rounds=28, wait_ms=450)
-                if token:
-                    self.log(f"  Turnstile token: {token[:40]}...")
-                    return token
-            except Exception as e:
-                last_error = str(e)
-
-            try:
-                token = self._native_click_turnstile(
-                    page, box, min(28, max(18, box["width"] * 0.08))
-                )
-                if token:
-                    self.log(f"  Turnstile token: {token[:40]}...")
-                    return token
-            except Exception as e:
-                last_error = str(e)
-
-            if self._has_turnstile_error(page):
-                self.log("  检测到 Turnstile 验证失败提示，准备重试...")
-            page.wait_for_timeout(900 + attempt * 120)
-
         try:
-            token = self._solve_turnstile_by_solver(page)
-            if token:
-                self.log(f"  Turnstile token(兜底): {token[:40]}...")
-                return token
-        except Exception as e:
-            last_error = str(e)
-
-        raise RuntimeError(last_error or "Turnstile 求解失败")
-
-    def _submit_register(self, page) -> None:
-        self.log("Step6: 提交完成注册...")
-
-        def _tos_or_account_ready() -> bool:
-            url = page.url
-            body = page.locator("body").inner_text()
-            return (
-                "/accept-tos" in url
-                or "/account" in url
-                or page.locator("input[type=checkbox]").count() >= 2
-                or "接受服务条款" in body
-                or "您的账户" in body
-                or self._has_auth_cookies(page.context.cookies())
-            )
-
-        last_error = "等待注册后跳转超时"
-        for submit_attempt in range(1, 4):
-            page.locator("button[type=submit]").click()
-            page.wait_for_timeout(900)
-            start = time.time()
-            while time.time() - start < 18:
-                if _tos_or_account_ready():
-                    page.wait_for_timeout(1200)
-                    return
-                if self._has_turnstile_error(page):
-                    last_error = "Cloudflare 验证失败"
-                    break
-                page.wait_for_timeout(500)
-            else:
-                last_error = "等待注册后跳转超时"
-
-            if submit_attempt < 3:
-                self.log(f"  提交失败({last_error})，重新过 Turnstile 后重试...")
-                self._solve_turnstile_on_page(page)
-
-        raise RuntimeError(last_error)
-
-    def _accept_tos_if_needed(self, page) -> None:
-        def _tos_or_account_or_cookie() -> bool:
-            url = page.url
-            body = page.locator("body").inner_text()
-            return (
-                page.locator("input[type=checkbox]").count() >= 2
-                or "/accept-tos" in url
-                or "/account" in url
-                or "接受服务条款" in body
-                or "您的账户" in body
-                or self._has_auth_cookies(page.context.cookies())
-            )
-
-        try:
-            self._wait_until(_tos_or_account_or_cookie, timeout=12, interval=0.5)
+            page.run_js("try { turnstile.reset() } catch (e) {}")
         except Exception:
             pass
 
-        if page.locator("input[type=checkbox]").count() < 2:
-            page.wait_for_timeout(2500)
-            if page.locator("input[type=checkbox]").count() < 2:
-                return
-
-        self.log("Step7: 接受 ToS ...")
-        checkbox_labels = [
-            "我确认已阅读并接受 企业服务条款，并知晓 隐私政策。",
-            "我确认我已年满 18 岁。",
-        ]
-        for label in checkbox_labels:
+        for attempt in range(15):
             try:
-                box = page.get_by_role("checkbox", name=label)
-                if not box.is_checked():
-                    box.check()
+                self._raise_if_cloudflare_gate(page)
+                token = page.run_js(
+                    "try { return turnstile.getResponse() } catch(e) { return null }"
+                )
+                if token:
+                    self._inject_turnstile_token(page, token)
+                    return str(token)
+                challenge_solution = page.ele("@name=cf-turnstile-response")
+                challenge_wrapper = challenge_solution.parent()
+                challenge_iframe = challenge_wrapper.shadow_root.ele("tag:iframe")
+                challenge_iframe.run_js(TURNSTILE_CHALLENGE_PATCH_SCRIPT)
+                challenge_body = challenge_iframe.ele("tag:body").shadow_root
+                challenge_button = challenge_body.ele("tag:input")
+                self.log(f"turnstile direct click #{attempt + 1}")
+                challenge_button.click()
+            except PageDisconnectedError:
+                page = self.refresh_active_page()
+                self.page = page
+            except Exception as exc:
+                last_error = str(exc)
+            self._random_delay(0.5, 1.5)
+
+        self._raise_if_cloudflare_gate(page)
+        token = self._read_turnstile_token(page)
+        if token:
+            self._inject_turnstile_token(page, token)
+            return token
+        token = self._solve_turnstile_by_solver(page)
+        if token:
+            return token
+        raise RuntimeError(last_error or "turnstile solve failed")
+
+    @staticmethod
+    def _cookie_name(cookie: Any) -> str:
+        if isinstance(cookie, dict):
+            return str(cookie.get("name", "") or "")
+        return str(getattr(cookie, "name", "") or "")
+
+    @staticmethod
+    def _cookie_value(cookie: Any) -> str:
+        if isinstance(cookie, dict):
+            return str(cookie.get("value", "") or "")
+        return str(getattr(cookie, "value", "") or "")
+
+    @staticmethod
+    def _cookie_domain(cookie: Any) -> str:
+        if isinstance(cookie, dict):
+            return str(cookie.get("domain", "") or "")
+        return str(getattr(cookie, "domain", "") or "")
+
+    @classmethod
+    def _has_auth_cookies(cls, cookies: list[Any]) -> bool:
+        return any(cls._cookie_name(cookie) in {"sso", "sso-rw"} for cookie in cookies)
+
+    def _collect_all_cookies(self) -> list[Any]:
+        pages_to_check: list[Any] = []
+        if self.page is not None:
+            pages_to_check.append(self.page)
+        try:
+            tabs = self.browser.get_tabs() if self.browser is not None else []
+            for tab in tabs:
+                if tab not in pages_to_check:
+                    pages_to_check.append(tab)
+        except Exception:
+            pass
+
+        out: list[Any] = []
+        seen: set[tuple[str, str, str]] = set()
+        for tab in pages_to_check:
+            for kwargs in ({"all_domains": True, "all_info": True}, {"all_domains": False, "all_info": True}):
+                try:
+                    cookies = tab.cookies(**kwargs) or []
+                except Exception:
+                    continue
+                for cookie in cookies:
+                    key = (self._cookie_name(cookie), self._cookie_domain(cookie), self._cookie_value(cookie))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(cookie)
+        return out
+
+    def _submit_register(self, page) -> None:
+        self.log("step6: submit final register")
+        if not self._read_turnstile_token(page):
+            self._solve_turnstile_on_page(page)
+        page.run_js(
+            r"""
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]'));
+const target = buttons.find((node) => {
+    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
+    return text.includes('完成注册') || text.includes('createaccount') || text.includes('signup') || text.includes('register');
+});
+if (target) target.click();
+return !!target;
+            """
+        )
+
+    def _accept_tos_if_needed(self, page) -> None:
+        if self._has_auth_cookies(self._collect_all_cookies()):
+            return
+        page.run_js(
+            r"""
+const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+for (const box of boxes.slice(0, 2)) {
+    if (!box.checked) box.click();
+}
+const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'));
+const nextBtn = buttons.find((node) => {
+    const text = (node.innerText || node.textContent || node.value || '').replace(/\s+/g, '').toLowerCase();
+    return text.includes('继续') || text.includes('accept') || text.includes('continue') || text.includes('同意');
+});
+if (nextBtn) nextBtn.click();
+return true;
+            """
+        )
+
+    def _wait_for_auth_cookies(self, timeout: int = SSO_COOKIE_TIMEOUT) -> list[Any]:
+        deadline = time.time() + timeout
+        last_seen_names: set[str] = set()
+        last_progress_log_at = 0.0
+        home_refreshed = False
+
+        while time.time() < deadline:
+            try:
+                self.refresh_active_page()
             except Exception:
                 pass
 
-        page.get_by_role("button", name="继续").click()
+            pages_to_check = []
+            if self.page is not None:
+                pages_to_check.append(self.page)
 
-        def _account_ready() -> bool:
-            url = page.url
-            body = page.locator("body").inner_text()
-            return (
-                "/account" in url
-                or "您的账户" in body
-                or self._has_auth_cookies(page.context.cookies())
-            )
+            try:
+                tabs = self.browser.get_tabs() if self.browser is not None else []
+                for tab in tabs:
+                    if tab is not None and tab not in pages_to_check:
+                        pages_to_check.append(tab)
+            except Exception:
+                pass
 
-        self._wait_until(_account_ready, timeout=20, desc="等待账户页超时")
-        page.wait_for_timeout(1500)
+            if not pages_to_check:
+                time.sleep(0.5)
+                continue
 
-    @staticmethod
-    def _pick_cookie(cookies: list, name: str) -> str:
-        domains = [
-            ".x.ai",
-            "accounts.x.ai",
-            ".grok.com",
-            ".grokusercontent.com",
-            ".grokipedia.com",
-        ]
+            for tab in pages_to_check:
+                for cookie_kwargs in (
+                    {"all_domains": True, "all_info": True},
+                    {"all_domains": False, "all_info": True},
+                ):
+                    try:
+                        cookies = tab.cookies(**cookie_kwargs) or []
+                    except PageDisconnectedError:
+                        continue
+                    except Exception:
+                        continue
+
+                    for item in cookies:
+                        name = self._cookie_name(item).strip()
+                        value = self._cookie_value(item).strip()
+                        if name:
+                            last_seen_names.add(name)
+                        if name.lower() == "sso" and value:
+                            return self._collect_all_cookies()
+
+            now = time.time()
+            if now - last_progress_log_at >= 10:
+                remain = max(0, int(deadline - now))
+                self.log(
+                    f"waiting sso cookie, remain ~{remain}s, seen: {sorted(last_seen_names)[:12]}"
+                )
+                last_progress_log_at = now
+
+            if not home_refreshed and now - (deadline - timeout) > 8 and self.page is not None:
+                current_url = self._current_url(self.page)
+                if "grok.com" in current_url or "x.ai" in current_url:
+                    try:
+                        self.page.get("https://grok.com")
+                        home_refreshed = True
+                    except Exception:
+                        pass
+
+            time.sleep(0.5)
+
+        raise RuntimeError(f"sso cookie not found, seen cookies: {sorted(last_seen_names)}")
+
+    @classmethod
+    def _pick_cookie(cls, cookies: list[Any], name: str) -> str:
+        domains = [".x.ai", "accounts.x.ai", ".grok.com", ".grokusercontent.com", ".grokipedia.com"]
         for domain in domains:
             for cookie in cookies:
-                if cookie.get("name") == name and cookie.get("domain") == domain:
-                    return cookie.get("value", "")
+                if cls._cookie_name(cookie) == name and cls._cookie_domain(cookie) == domain:
+                    return cls._cookie_value(cookie)
         for cookie in cookies:
-            if cookie.get("name") == name:
-                return cookie.get("value", "")
+            if cls._cookie_name(cookie) == name:
+                return cls._cookie_value(cookie)
         return ""
 
-    def register(
-        self,
-        email: str,
-        password: Optional[str] = None,
-        otp_callback: Optional[Callable[[], str]] = None,
-    ) -> dict:
+    def register(self, email: str, password: Optional[str] = None, otp_callback: Optional[Callable[[], str]] = None) -> dict[str, Any]:
         if not password:
             password = _rand_password()
         given_name = _rand_name()
         family_name = _rand_name()
 
-        playwright = None
-        browser = None
-        context = None
         try:
-            playwright, browser = self._launch_browser()
-            context = browser.new_context(
-                viewport={"width": 1400, "height": 1200},
-                user_agent=UA,
-            )
-            page = context.new_page()
-
-            self._goto_email_signup(page)
+            page = self.start_browser()
+            self._apply_turnstile_mouse_patch(page)
+            page = self.open_signup_page()
             self._submit_email(page, email)
-
-            if not otp_callback:
-                code = input("验证码: ").strip()
-            else:
-                self.log("等待验证码...")
+            if otp_callback:
+                self.log("waiting otp callback")
                 code = otp_callback() or ""
+            else:
+                code = input("otp code: ").strip()
             if not code:
-                raise RuntimeError("未获取到验证码")
-
+                raise RuntimeError("otp not available")
+            page = self.refresh_active_page()
             self._submit_otp(page, code)
-            self._fill_user_form(page, given_name, family_name, password)
-            self._solve_turnstile_on_page(page)
-            self._submit_register(page)
-            self._accept_tos_if_needed(page)
-
-            cookies = context.cookies()
-            if not self._has_auth_cookies(cookies):
-                page.wait_for_timeout(5000)
-                cookies = context.cookies()
+            self._wait_until(lambda: self.has_profile_form(), timeout=25, interval=0.5, desc="profile form not ready")
+            page = self.refresh_active_page()
+            self._fill_profile_and_submit(page, given_name, family_name, password)
+            cookies = self._wait_for_auth_cookies()
             sso = self._pick_cookie(cookies, "sso")
             sso_rw = self._pick_cookie(cookies, "sso-rw")
             if not sso:
-                raise RuntimeError("注册成功但未提取到 sso cookie")
-
-            self.log(f"  ✅ sso={sso[:40]}...")
-            self.log("Grok 注册链路完成")
+                raise RuntimeError("register finished but sso cookie missing")
+            self.log("grok registration flow completed")
             return {
                 "email": email,
                 "password": password,
@@ -577,19 +1333,10 @@ class GrokRegister:
                 "sso_rw": sso_rw,
                 "cookies": cookies,
             }
+        except Exception:
+            if self.page is not None:
+                self._dump_debug_artifacts(self.page, "register-failure")
+            self._hold_browser_for_debug()
+            raise
         finally:
-            try:
-                if context:
-                    context.close()
-            except Exception:
-                pass
-            try:
-                if browser:
-                    browser.close()
-            except Exception:
-                pass
-            try:
-                if playwright:
-                    playwright.stop()
-            except Exception:
-                pass
+            self.stop_browser()

@@ -32,13 +32,21 @@ class GrokPlatform(BasePlatform):
             "yescaptcha_key", ""
         )
         captcha_solver = self._make_captcha(key=yescaptcha_key)
-        requested_headless = (self.config.executor_type or "protocol") != "headed"
+        requested_headless = (self.config.executor_type or "headed") == "headless"
+        keep_on_failure = bool(
+            self.config.extra.get("grok_keep_browser_open_on_failure", not requested_headless)
+        )
+        hold_seconds = int(
+            self.config.extra.get("grok_failure_hold_seconds", 45 if keep_on_failure else 0)
+        )
         reg = GrokRegister(
             captcha_solver=captcha_solver,
             yescaptcha_key=yescaptcha_key,
             proxy=self.config.proxy,
             log_fn=log,
             headless=requested_headless,
+            keep_browser_open_on_failure=keep_on_failure,
+            failure_hold_seconds=hold_seconds,
         )
         mailbox_attempts = (
             1 if email else int(self.config.extra.get("grok_mailbox_attempts", 8))
